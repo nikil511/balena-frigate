@@ -1,0 +1,146 @@
+#!/command/with-contenv bash
+# shellcheck shell=bash
+# Generate models for the TensorRT detector and seed Jetson default config if needed
+
+set -o errexit -o nounset -o pipefail
+
+MODEL_CACHE_DIR=${MODEL_CACHE_DIR:-"/config/model_cache/tensorrt"}
+TRT_VER=${TRT_VER:-$(cat /etc/TENSORRT_VER)}
+OUTPUT_FOLDER="${MODEL_CACHE_DIR}/${TRT_VER}"
+YOLO_MODELS=${YOLO_MODELS:-"yolov7-tiny-416"}
+CONFIG_FILE=${CONFIG_FILE:-"/config/frigate.yml"}
+
+# Ensure dynamic linker cache includes Tegra & CUDA libraries
+ldconfig || true
+
+# Create output folder
+mkdir -p "${OUTPUT_FOLDER}"
+
+FIRST_MODEL=true
+DEFAULT_MODEL=""
+MODEL_DOWNLOAD=""
+MODEL_CONVERT=""
+
+if [ -z "$YOLO_MODELS" ]; then
+    echo "tensorrt model preparation disabled"
+    exit 0
+fi
+
+for model in ${YOLO_MODELS//,/ }
+do
+    if [[ -z "${DEFAULT_MODEL}" ]]; then
+        DEFAULT_MODEL="${model}"
+    fi
+
+    # Remove old link in case path/version changed
+    rm -f "${MODEL_CACHE_DIR}/${model}.trt"
+
+    if [[ ! -f "${OUTPUT_FOLDER}/${model}.trt" ]]; then
+        if [[ ${FIRST_MODEL} = true ]]; then
+            MODEL_DOWNLOAD="${model%-dla}"
+            MODEL_CONVERT="${model}"
+            FIRST_MODEL=false
+        else
+            MODEL_DOWNLOAD+=",${model%-dla}"
+            MODEL_CONVERT+=",${model}"
+        fi
+    else
+        ln -sf "${OUTPUT_FOLDER}/${model}.trt" "${MODEL_CACHE_DIR}/${model}.trt"
+    fi
+done
+
+if [[ -n "${MODEL_CONVERT}" ]]; then
+    # Setup ENV to select GPU for conversion
+    if [ ! -z ${TRT_MODEL_PREP_DEVICE+x} ]; then
+        if [ ! -z ${CUDA_VISIBLE_DEVICES+x} ]; then
+            PREVIOUS_CVD="$CUDA_VISIBLE_DEVICES"
+            unset CUDA_VISIBLE_DEVICES
+        fi
+        export CUDA_VISIBLE_DEVICES="$TRT_MODEL_PREP_DEVICE"
+    fi
+
+    echo "Generating the following TRT Models: ${MODEL_CONVERT}"
+
+    # Build trt engine
+    cd /usr/local/src/tensorrt_demos/yolo
+
+    echo "Downloading yolo weights"
+    ./download_yolo.sh "$MODEL_DOWNLOAD" 2> /dev/null
+
+    for model in ${MODEL_CONVERT//,/ }
+    do
+        python3 yolo_to_onnx.py -m "${model%-dla}" > /dev/null
+
+        echo -e "\nGenerating ${model}.trt on Jetson GPU. This may take a few minutes...\n"
+        start=$(date +%s)
+        if [[ $model == *-dla ]]; then
+            cmd="python3 onnx_to_tensorrt.py -m ${model%-dla} --dla_core 0"
+        else
+            cmd="python3 onnx_to_tensorrt.py -m ${model}"
+        fi
+        $cmd > /tmp/onnx_to_tensorrt.log 2>&1 || { cat /tmp/onnx_to_tensorrt.log && continue; }
+
+        mv "${model%-dla}.trt" "${OUTPUT_FOLDER}/${model}.trt"
+        ln -sf "${OUTPUT_FOLDER}/${model}.trt" "${MODEL_CACHE_DIR}/${model}.trt"
+        rm -f "${model%-dla}.onnx"
+        echo "Generated ${model}.trt in $(($(date +%s)-start)) seconds"
+    done
+
+    # Restore ENV after conversion
+    if [ ! -z ${TRT_MODEL_PREP_DEVICE+x} ]; then
+        unset CUDA_VISIBLE_DEVICES
+        if [ ! -z ${PREVIOUS_CVD+x} ]; then
+            export CUDA_VISIBLE_DEVICES="$PREVIOUS_CVD"
+        fi
+    fi
+else
+    echo "All requested TensorRT models already exist in ${OUTPUT_FOLDER}."
+fi
+
+# Print which models exist in output folder
+echo "Available tensorrt models:"
+ls -la "${OUTPUT_FOLDER}"/*.trt || true
+
+# Seed a Jetson-optimized Frigate configuration if no config file exists yet
+CONFIG_FILE_YAML="${CONFIG_FILE//.yml/.yaml}"
+if [[ ! -f "${CONFIG_FILE}" && ! -f "${CONFIG_FILE_YAML}" ]]; then
+    MODEL_DIM="${DEFAULT_MODEL##*-}"
+    if ! [[ "${MODEL_DIM}" =~ ^[0-9]+$ ]]; then
+        MODEL_DIM=416
+    fi
+    echo "[INFO] Creating Jetson GPU-optimized default config at ${CONFIG_FILE}"
+    cat <<EOF > "${CONFIG_FILE}"
+mqtt:
+  enabled: false
+
+detectors:
+  tensorrt:
+    type: tensorrt
+    device: 0
+
+model:
+  path: ${MODEL_CACHE_DIR}/${DEFAULT_MODEL}.trt
+  input_tensor: nchw
+  input_pixel_format: rgb
+  width: ${MODEL_DIM}
+  height: ${MODEL_DIM}
+
+ffmpeg:
+  hwaccel_args: preset-jetson-h264
+
+cameras: {}
+
+version: 0.18-0
+EOF
+elif [[ -f "${CONFIG_FILE}" ]]; then
+    # Scrub any plaintext RTSP credentials/IPs in existing config to use {FRIGATE_*} secret placeholders
+    if [[ -n "${FRIGATE_RTSP_PASSWORD:-}" && -n "${FRIGATE_RTSP_USER:-}" ]]; then
+        sed -i "s|${FRIGATE_RTSP_USER}:${FRIGATE_RTSP_PASSWORD}|{FRIGATE_RTSP_USER}:{FRIGATE_RTSP_PASSWORD}|g" "${CONFIG_FILE}" || true
+    fi
+    if [[ -n "${FRIGATE_CAM1_IP:-}" ]]; then
+        sed -i "s|@${FRIGATE_CAM1_IP}:|@{FRIGATE_CAM1_IP}:|g" "${CONFIG_FILE}" || true
+    fi
+    if [[ -n "${FRIGATE_CAM2_IP:-}" ]]; then
+        sed -i "s|@${FRIGATE_CAM2_IP}:|@{FRIGATE_CAM2_IP}:|g" "${CONFIG_FILE}" || true
+    fi
+fi

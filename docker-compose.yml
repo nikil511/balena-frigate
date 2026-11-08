@@ -3,25 +3,38 @@ version: "2.1"
 services:
   # https://docs.frigate.video/frigate/installation#docker
   frigate:
-    image: ghcr.io/blakeblackshear/frigate:0.18.2@sha256:fd60f99ffd4eb6c42360ed4e14953e270586f239309ab3983e55b2e97ffac09a
+    build: .
     privileged: true
+    restart: unless-stopped
     ports:
-      - "80:8971"
-      # - "5000:5000" # Internal unauthenticated access. Expose carefully.
+      - "8971:8971"
+      - "5000:5000" # Internal unauthenticated access. Expose carefully.
       - "8554:8554" # RTSP feeds
       - "8555:8555/tcp" # WebRTC over tcp
       - "8555:8555/udp" # WebRTC over udp
     volumes:
-      - config:/config:ro
+      - config:/config
       - media:/media/frigate
     tmpfs:
-      - /tmp/cache
-    shm_size: 2048M
+      - /tmp/cache:size=256m
+    shm_size: 256M
     environment:
-      FRIGATE_RTSP_PASSWORD: "balena"
       CONFIG_FILE: "/config/frigate.yml"
+      YOLO_MODELS: "yolov7-tiny-416"
+      USE_FP16: "true"
+      UDEV: "1"
     labels:
       io.balena.features.kernel-modules: 1
+      io.balena.features.sysfs: 1
+
+  proxy:
+    build: ./proxy
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - frigate
+    environment:
+      FRIGATE_HOST: "127.0.0.1:5000"
 
   # https://github.com/balenablocks/hostname
   hostname:
@@ -32,13 +45,13 @@ services:
     environment:
       SET_HOSTNAME: frigate
 
-  # https://hub.docker.com/r/mrlt8/wyze-bridge/tags
-  wyze-bridge:
-    image: mrlt8/wyze-bridge:2.10.3@sha256:af2d638a6d6d52e15ddcfb711e5b905e484b1f519986ad33b9be562b6277b987
-    volumes:
-      - tokens:/tokens
+  # # https://hub.docker.com/r/mrlt8/wyze-bridge/tags
+  # wyze-bridge:
+  #   image: mrlt8/wyze-bridge:2.10.3@sha256:af2d638a6d6d52e15ddcfb711e5b905e484b1f519986ad33b9be562b6277b987
+  #   volumes:
+  #     - tokens:/tokens
 
 volumes:
   config:
   media:
-  tokens:
+  # tokens:

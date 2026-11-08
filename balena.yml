@@ -1,14 +1,14 @@
 name: "Frigate"
 type: "sw.application"
 # renovate: datasource=docker depName=ghcr.io/blakeblackshear/frigate
-version: 0.18.2
-description: "A complete and local NVR designed for Home Assistant with AI object detection."
+version: 0.15.2-tensorrt-jp4
+description: "A complete and local NVR designed for Home Assistant with AI object detection, optimized for NVIDIA Jetson Nano (JetPack 4.6 / L4T R32.7)."
 post-provisioning: >-
   ## Usage instructions
 
-  Once your device joins the fleet you'll need to allow some time for it to download the application and start the services.
+  Once your device joins the fleet you'll need to allow some time for it to download the application and generate the TensorRT model on first boot.
 
-  When it's done you should be able to access the access the app at http://frigate.local.
+  When it's done you should be able to access the app at http://frigate.local (or port 5000).
 
   Additional usage instructions for Frigate can be found here: <https://blakeblackshear.github.io/frigate/>.
 
@@ -16,18 +16,14 @@ assets:
   repository:
     type: "blob.asset"
     data:
-      url: "https://github.com/klutchell/balena-frigate"
+      url: "https://github.com/nikil511/balena-frigate"
   logo:
     type: "blob.asset"
     data:
-      url: "https://raw.githubusercontent.com/klutchell/balena-frigate/main/logo.png"
+      url: "https://raw.githubusercontent.com/nikil511/balena-frigate/main/logo.png"
 data:
-  defaultDeviceType: "intel-nuc"
+  defaultDeviceType: "jetson-nano"
   supportedDeviceTypes:
-    - "intel-nuc"
-    - "genericx86-64-ext"
     - "jetson-nano"
-    - "raspberrypi4-64"
-    - "coral-dev"
-  applicationConfigVariables:
-    BALENA_HOST_CONFIG_gpu_mem: 128
+    - "jetson-nano-emmc"
+    - "jetson-nano-2gb-devkit"
