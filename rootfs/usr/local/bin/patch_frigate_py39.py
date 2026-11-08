@@ -76,6 +76,13 @@ except ImportError:
 
 # 5. Expose _Py39Union in builtins for AST-rewritten PEP 604 (X | Y) type unions
 builtins._Py39Union = typing.Union
+
+# 6. Alias asyncio.TimeoutError to builtins.TimeoutError (Python 3.11+ behavior)
+import asyncio
+import asyncio.exceptions
+
+asyncio.TimeoutError = builtins.TimeoutError
+asyncio.exceptions.TimeoutError = builtins.TimeoutError
 '''
 
 
@@ -310,6 +317,96 @@ def patch_specific_files(frigate_root: pathlib.Path) -> None:
             "            try:\n                importlib.import_module(module_name)\n            except ImportError as e:\n                logger.debug(f'Optional GenAI provider {module_name} not available: {e}')",
         )
         genai_init_py.write_text(txt, encoding="utf-8")
+
+    # 4. frigate/util/services.py:
+    #    - Only pass -rw_timeout to ffprobe when url is a network URL ("://" in url);
+    #      passing -rw_timeout on local .mp4 files causes ffprobe to fail with
+    #      "Option rw_timeout not found".
+    #    - Prefer ffprobe (FFmpeg 6.0) over OpenCV 4.2 (libavformat58) when probing
+    #      recording segments so in-band HEVC SPS/PPS segments probe cleanly without
+    #      cap_ffmpeg_impl.hpp errors.
+    services_py = frigate_root / "frigate" / "util" / "services.py"
+    if services_py.exists():
+        txt = services_py.read_text(encoding="utf-8")
+        old_probe_cmd = '''        cmd += [
+            "-rw_timeout",
+            "5000000",
+            "-v",'''
+        new_probe_cmd = '''        if "://" in url:
+            cmd += ["-rw_timeout", "5000000"]
+        else:
+            cmd += ["-analyzeduration", "10000000", "-probesize", "10000000"]
+        cmd += [
+            "-v",'''
+        txt = txt.replace(old_probe_cmd, new_probe_cmd)
+
+        old_probe_branch = '''    if is_rtsp:
+        # skip cv2 for RTSP: its FFmpeg backend has a hardcoded ~30s internal
+        # timeout that cannot be shortened per-call, and ffprobe bounded by
+        # -rw_timeout handles RTSP probing reliably
+        has_video, width, height, fourcc, duration = await probe_with_ffprobe(url)
+    else:
+        # try cv2 first for local files, HTTP, RTMP
+        has_video, width, height, fourcc, duration = probe_with_cv2(url)
+
+        # fallback to ffprobe if needed
+        if not has_video or (get_duration and duration < 0):
+            has_video, width, height, fourcc, duration = await probe_with_ffprobe(url)'''
+        new_probe_branch = '''    has_video, width, height, fourcc, duration = await probe_with_ffprobe(url)
+    if not is_rtsp and (not has_video or (get_duration and duration < 0)):
+        has_video, width, height, fourcc, duration = probe_with_cv2(url)'''
+        txt = txt.replace(old_probe_branch, new_probe_branch)
+        services_py.write_text(txt, encoding="utf-8")
+
+    # 5. frigate/config/camera/camera.py:
+    #    Decouple "detect" and "record" into separate FFmpeg commands when combined on a
+    #    single input. On Jetson L4T, nvmpi hardware decoders (-c:v hevc_nvmpi / h264_nvmpi)
+    #    do not populate codecpar->extradata during stream probing; separating the record
+    #    stream (-c copy without nvmpi) ensures valid hvcC/avcC headers in MP4 segments
+    #    even for cameras that send HEVC VPS/SPS/PPS in-band.
+    camera_py = frigate_root / "frigate" / "config" / "camera" / "camera.py"
+    if camera_py.exists():
+        txt = camera_py.read_text(encoding="utf-8")
+        old_build_cmds = '''    def _build_ffmpeg_cmds(self):
+        """Build ffmpeg commands from the current ffmpeg config."""
+        ffmpeg_cmds = []
+        for ffmpeg_input in self.ffmpeg.inputs:
+            ffmpeg_cmd = self._get_ffmpeg_cmd(ffmpeg_input)
+            if ffmpeg_cmd is None:
+                continue
+
+            ffmpeg_cmds.append({"roles": ffmpeg_input.roles, "cmd": ffmpeg_cmd})
+        self._ffmpeg_cmds = ffmpeg_cmds'''
+        new_build_cmds = '''    def _build_ffmpeg_cmds(self):
+        """Build ffmpeg commands from the current ffmpeg config."""
+        ffmpeg_cmds = []
+        for ffmpeg_input in self.ffmpeg.inputs:
+            if (
+                "detect" in ffmpeg_input.roles
+                and "record" in ffmpeg_input.roles
+                and self.record.enabled
+            ):
+                detect_input = ffmpeg_input.model_copy(
+                    update={"roles": [r for r in ffmpeg_input.roles if r != "record"]}
+                )
+                detect_cmd = self._get_ffmpeg_cmd(detect_input)
+                if detect_cmd is not None:
+                    ffmpeg_cmds.append({"roles": detect_input.roles, "cmd": detect_cmd})
+                record_input = ffmpeg_input.model_copy(
+                    update={"roles": [r for r in ffmpeg_input.roles if r == "record"], "hwaccel_args": []}
+                )
+                record_cmd = self._get_ffmpeg_cmd(record_input)
+                if record_cmd is not None:
+                    ffmpeg_cmds.append({"roles": record_input.roles, "cmd": record_cmd})
+                continue
+            ffmpeg_cmd = self._get_ffmpeg_cmd(ffmpeg_input)
+            if ffmpeg_cmd is None:
+                continue
+
+            ffmpeg_cmds.append({"roles": ffmpeg_input.roles, "cmd": ffmpeg_cmd})
+        self._ffmpeg_cmds = ffmpeg_cmds'''
+        txt = txt.replace(old_build_cmds, new_build_cmds)
+        camera_py.write_text(txt, encoding="utf-8")
 
 
 def main() -> None:
